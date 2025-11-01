@@ -10,7 +10,7 @@ from typing import Optional
 
 from ..config import get_settings
 from ..state import ConversationState
-from ..llm.mock_llm import MockLLM, BaseLLM
+from ..llm import BaseLLM, LLMFactory
 
 
 logger = logging.getLogger(__name__)
@@ -45,12 +45,7 @@ class PlannerNode:
         Returns:
             Configured LLM instance
         """
-        if self.settings.llm_mode.value == "mock":
-            return MockLLM()
-        else:
-            # TODO: Implement OllamaLLM in future story
-            logger.warning("Ollama mode not implemented yet, falling back to MockLLM")
-            return MockLLM()
+        return LLMFactory.create_llm()
     
     async def execute(self, state: ConversationState) -> ConversationState:
         """Execute the planning process for the given conversation state.
