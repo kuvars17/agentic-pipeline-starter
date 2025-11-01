@@ -1,0 +1,197 @@
+"""Planner node for generating multi-step plans using LLM.
+
+This module implements the PlannerNode that serves as the strategic thinking
+component of the agentic system, analyzing user queries and generating
+structured, executable plans.
+"""
+
+import logging
+from typing import Optional
+
+from ..config import get_settings
+from ..state import ConversationState
+from ..llm.mock_llm import MockLLM, BaseLLM
+
+
+logger = logging.getLogger(__name__)
+
+
+class PlannerNode:
+    """Planner node that generates multi-step plans for user queries.
+    
+    This node serves as the strategic thinking component of the agentic system,
+    analyzing user queries and generating structured, executable plans that
+    guide the subsequent processing steps.
+    
+    Attributes:
+        llm: The LLM instance for plan generation
+        settings: Application settings
+    """
+    
+    def __init__(self, llm: Optional[BaseLLM] = None):
+        """Initialize the Planner node.
+        
+        Args:
+            llm: Optional LLM instance. If None, will create based on settings.
+        """
+        self.settings = get_settings()
+        self.llm = llm or self._create_llm()
+        
+        logger.info(f"PlannerNode initialized with {type(self.llm).__name__}")
+    
+    def _create_llm(self) -> BaseLLM:
+        """Create LLM instance based on configuration.
+        
+        Returns:
+            Configured LLM instance
+        """
+        if self.settings.llm_mode.value == "mock":
+            return MockLLM()
+        else:
+            # TODO: Implement OllamaLLM in future story
+            logger.warning("Ollama mode not implemented yet, falling back to MockLLM")
+            return MockLLM()
+    
+    async def execute(self, state: ConversationState) -> ConversationState:
+        """Execute the planning process for the given conversation state.
+        
+        Args:
+            state: Current conversation state containing the user query
+            
+        Returns:
+            Updated conversation state with generated plan
+            
+        Raises:
+            ValueError: If the query is empty or invalid
+            RuntimeError: If plan generation fails critically
+        """
+        try:
+            logger.info(f"Starting plan generation for conversation {state.conversation_id}")
+            
+            # Validate input
+            if not state.query or not state.query.strip():
+                raise ValueError("Query cannot be empty for plan generation")
+            
+            # Generate plan using LLM
+            plan_text = await self._generate_plan(state.query)
+            
+            # Parse and structure the plan
+            plan_steps = self._parse_plan(plan_text)
+            
+            # Update state with generated plan
+            for step in plan_steps:
+                state.add_plan_step(step)
+            
+            # Add metadata
+            state.update_metadata("planner_executed", True)
+            state.update_metadata("plan_steps_count", len(plan_steps))
+            
+            logger.info(f"Successfully generated {len(plan_steps)} plan steps")
+            return state
+            
+        except ValueError as e:
+            error_msg = f"Validation error in planner: {str(e)}"
+            logger.error(error_msg)
+            state.add_error(error_msg)
+            return state
+            
+        except Exception as e:
+            error_msg = f"Unexpected error in planner: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            state.add_error(error_msg)
+            return state
+    
+    async def _generate_plan(self, query: str) -> str:
+        """Generate plan using the LLM.
+        
+        Args:
+            query: User query to generate plan for
+            
+        Returns:
+            Generated plan text from LLM
+            
+        Raises:
+            RuntimeError: If LLM generation fails
+        """
+        try:
+            # Create planning prompt
+            prompt = self._create_planning_prompt(query)
+            
+            # Generate plan using LLM
+            plan_text = await self.llm.generate(prompt)
+            
+            if not plan_text or not plan_text.strip():
+                raise RuntimeError("LLM returned empty plan")
+            
+            return plan_text.strip()
+            
+        except Exception as e:
+            logger.error(f"Failed to generate plan: {str(e)}")
+            raise RuntimeError(f"Plan generation failed: {str(e)}")
+    
+    def _create_planning_prompt(self, query: str) -> str:
+        """Create planning prompt for the LLM.
+        
+        Args:
+            query: User query to create prompt for
+            
+        Returns:
+            Formatted planning prompt
+        """
+        prompt = f"""You are an expert AI planning assistant. Your task is to create a clear, actionable plan to answer the user's query.
+
+User Query: "{query}"
+
+Please create a step-by-step plan to answer this query. The plan should be:
+1. Specific and actionable
+2. Logically ordered
+3. Comprehensive but concise
+4. Focused on gathering information and providing an accurate answer
+
+Format your response as a numbered list of steps. Each step should be a clear action that can be executed.
+
+Plan:"""
+        
+        return prompt
+    
+    def _parse_plan(self, plan_text: str) -> list[str]:
+        """Parse plan text into structured steps.
+        
+        Args:
+            plan_text: Raw plan text from LLM
+            
+        Returns:
+            List of parsed plan steps
+        """
+        steps = []
+        
+        # Split by lines and process each
+        lines = plan_text.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Remove numbering (1., 2., etc.) and clean up
+            if line and (line[0].isdigit() or line.startswith('-') or line.startswith('*')):
+                # Remove leading numbering/bullets
+                cleaned = line
+                for prefix in ['1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.', '10.',
+                              '-', '*', '•']:
+                    if cleaned.startswith(prefix):
+                        cleaned = cleaned[len(prefix):].strip()
+                        break
+                
+                if cleaned:
+                    steps.append(cleaned)
+            elif line and not any(skip in line.lower() for skip in ['plan:', 'steps:', 'response:']):
+                # Include lines that don't start with numbers but seem like steps
+                steps.append(line)
+        
+        # Ensure we have at least one step
+        if not steps:
+            steps = ["Analyze the query and provide a comprehensive response"]
+        
+        logger.debug(f"Parsed {len(steps)} steps from plan")
+        return steps
