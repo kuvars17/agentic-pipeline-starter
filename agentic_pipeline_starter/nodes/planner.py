@@ -15,6 +15,7 @@ from ..llm.factory import LLMFactory
 from .prompt_templates import PromptTemplateManager, QueryType
 from .plan_validator import PlanValidator, ValidationResult, PlanQuality
 from .error_handler import PlannerErrorHandler, CircuitBreaker, ErrorType
+from .planner_logger import PlannerLogger, LogContext, ComponentType, performance_monitor
 
 
 logger = logging.getLogger(__name__)
@@ -38,18 +39,40 @@ class PlannerNode:
         Args:
             llm: Optional LLM instance. If None, will create based on settings.
         """
-        self.llm = llm or self._create_llm()
-        self.prompt_manager = PromptTemplateManager()
-        self.validator = PlanValidator()
+        # Initialize comprehensive logging
+        self.logger = PlannerLogger("PlannerNode")
         
-        # Initialize error handling and circuit breaker
-        self.error_handler = PlannerErrorHandler()
-        self.circuit_breaker = CircuitBreaker(
-            failure_threshold=5,
-            recovery_timeout=60.0
-        )
+        # Log initialization start
+        self.logger.push_context(LogContext(
+            component=ComponentType.PLANNER,
+            operation="initialization"
+        ))
         
-        logger.info(f"PlannerNode initialized with {type(self.llm).__name__} and error handling")
+        try:
+            self.llm = llm or self._create_llm()
+            self.prompt_manager = PromptTemplateManager()
+            self.validator = PlanValidator()
+            
+            # Initialize error handling and circuit breaker
+            self.error_handler = PlannerErrorHandler()
+            self.circuit_breaker = CircuitBreaker(
+                failure_threshold=5,
+                recovery_timeout=60.0
+            )
+            
+            self.logger.info(f"PlannerNode initialized successfully")
+            self.logger.audit("planner_initialization", {
+                "llm_type": type(self.llm).__name__,
+                "error_handler_enabled": True,
+                "circuit_breaker_enabled": True,
+                "validation_enabled": True
+            })
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize PlannerNode: {str(e)}", exc_info=True)
+            raise
+        finally:
+            self.logger.pop_context()
     
     def _create_llm(self) -> BaseLLM:
         """Create LLM instance based on configuration.
@@ -59,6 +82,7 @@ class PlannerNode:
         """
         return LLMFactory.create_llm()
     
+    @performance_monitor("plan_execution")
     async def execute(self, state: ConversationState) -> ConversationState:
         """Execute the planning phase with comprehensive error handling.
         
@@ -74,9 +98,21 @@ class PlannerNode:
         start_time = asyncio.get_event_loop().time()
         query = state.messages[-1].content if state.messages else ""
         
-        logger.info(f"Starting plan generation for query: {query[:100]}...")
+        # Set up logging context for this execution
+        execution_context = LogContext(
+            component=ComponentType.PLANNER,
+            operation="execute",
+            conversation_id=str(state.conversation_id),
+            query_id=f"query_{len(state.messages)}",
+            metadata={"query_length": len(query)}
+        )
+        self.logger.push_context(execution_context)
         
         try:
+            self.logger.info(f"Starting plan generation", 
+                           query_preview=query[:100] + "..." if len(query) > 100 else query,
+                           query_length=len(query))
+            
             # Use error handler for plan generation with fallback
             success, result = await self.error_handler.handle_with_fallback(
                 self._generate_plan_with_circuit_breaker,
@@ -86,44 +122,78 @@ class PlannerNode:
             
             if success:
                 plan_steps = result
-                logger.info(f"Plan generated successfully with {len(plan_steps)} steps")
+                self.logger.info(f"Plan generated successfully", 
+                               step_count=len(plan_steps),
+                               generation_method="llm")
             else:
                 # Result is the fallback plan
                 plan_steps = result
-                logger.warning("Using fallback plan due to generation failures")
-                state.add_error(f"Plan generation failed, using fallback: {type(result).__name__}")
+                self.logger.warning("Using fallback plan due to generation failures",
+                                  step_count=len(plan_steps),
+                                  generation_method="fallback")
+                state.add_error(f"Plan generation failed, using fallback")
             
             # Validate the plan (whether generated or fallback)
+            validation_start = asyncio.get_event_loop().time()
             validation_result = await self.validator.validate_plan(plan_steps, query)
+            validation_duration = (asyncio.get_event_loop().time() - validation_start) * 1000
+            
+            # Log validation results
+            self.logger.log_validation_result(
+                plan_steps=plan_steps,
+                quality_score=validation_result.score,
+                quality_level=validation_result.quality.value,
+                issues=validation_result.issues,
+                suggestions=validation_result.suggestions,
+                duration_ms=validation_duration
+            )
             
             # Update state with plan and validation results
             state.plan = plan_steps
-            state.add_metadata("plan_validation", {
+            total_duration = (asyncio.get_event_loop().time() - start_time) * 1000
+            
+            validation_metadata = {
                 "quality": validation_result.quality.value,
                 "score": validation_result.score,
                 "issues": validation_result.issues,
                 "suggestions": validation_result.suggestions,
                 "is_fallback": not success,
-                "generation_time": asyncio.get_event_loop().time() - start_time
-            })
+                "generation_time": total_duration,
+                "validation_time": validation_duration
+            }
+            state.add_metadata("plan_validation", validation_metadata)
             
             # Log quality assessment
             if validation_result.quality in [PlanQuality.EXCELLENT, PlanQuality.GOOD]:
-                logger.info(f"Plan quality: {validation_result.quality.value} (score: {validation_result.score:.2f})")
+                self.logger.info(f"High quality plan generated",
+                               quality=validation_result.quality.value,
+                               score=validation_result.score)
             else:
-                logger.warning(f"Plan quality: {validation_result.quality.value} (score: {validation_result.score:.2f})")
-                if validation_result.issues:
-                    logger.warning(f"Plan issues: {', '.join(validation_result.issues)}")
+                self.logger.warning(f"Low quality plan generated",
+                                  quality=validation_result.quality.value,
+                                  score=validation_result.score,
+                                  issues=validation_result.issues)
             
             # Add error history summary to metadata for debugging
             error_summary = self.error_handler.get_error_summary()
             if error_summary["total_errors"] > 0:
                 state.add_metadata("error_summary", error_summary)
+                self.logger.debug("Error summary added to state",
+                                error_count=error_summary["total_errors"])
+            
+            # Log successful completion
+            self.logger.audit("plan_execution_completed", {
+                "success": True,
+                "plan_steps": len(plan_steps),
+                "quality": validation_result.quality.value,
+                "duration_ms": total_duration,
+                "fallback_used": not success
+            })
             
             return state
             
         except Exception as e:
-            logger.error(f"Critical error in plan execution: {str(e)}", exc_info=True)
+            self.logger.critical(f"Critical error in plan execution: {str(e)}", exc_info=True)
             
             # Add error to state
             state.add_error(f"Critical planning error: {str(e)}")
@@ -135,17 +205,32 @@ class PlannerNode:
             ]
             
             state.plan = emergency_plan
+            total_duration = (asyncio.get_event_loop().time() - start_time) * 1000
+            
             state.add_metadata("plan_validation", {
                 "quality": "EMERGENCY",
                 "score": 0.1,
                 "issues": ["Emergency fallback used due to critical error"],
                 "suggestions": ["Manual intervention may be required"],
                 "is_fallback": True,
-                "generation_time": asyncio.get_event_loop().time() - start_time
+                "generation_time": total_duration
+            })
+            
+            # Log critical failure
+            self.logger.audit("plan_execution_failed", {
+                "success": False,
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "duration_ms": total_duration,
+                "emergency_fallback_used": True
             })
             
             return state
+            
+        finally:
+            self.logger.pop_context()
     
+    @performance_monitor("llm_plan_generation")
     async def _generate_plan_with_circuit_breaker(self, query: str) -> List[str]:
         """Generate plan using circuit breaker protection.
         
@@ -155,8 +240,23 @@ class PlannerNode:
         Returns:
             Generated plan steps
         """
-        return await self.circuit_breaker.call(self._generate_plan_internal, query)
+        self.logger.push_context(LogContext(
+            component=ComponentType.CIRCUIT_BREAKER,
+            operation="protected_call"
+        ))
+        
+        try:
+            self.logger.debug("Executing plan generation with circuit breaker protection")
+            result = await self.circuit_breaker.call(self._generate_plan_internal, query)
+            self.logger.debug("Circuit breaker call successful")
+            return result
+        except Exception as e:
+            self.logger.error(f"Circuit breaker call failed: {str(e)}")
+            raise
+        finally:
+            self.logger.pop_context()
     
+    @performance_monitor("internal_plan_generation")
     async def _generate_plan_internal(self, query: str) -> List[str]:
         """Internal plan generation method.
         
@@ -169,30 +269,125 @@ class PlannerNode:
         Raises:
             Various exceptions based on failure type
         """
-        # Generate prompt for the query
-        template = self.prompt_manager.get_template_for_query(query)
+        self.logger.push_context(LogContext(
+            component=ComponentType.PLANNER,
+            operation="generate_plan_internal",
+            metadata={"query_length": len(query)}
+        ))
         
-        if not template:
-            raise ValueError(f"No suitable template found for query type")
-        
-        # Generate plan using LLM
         try:
-            plan_response = await self.llm.generate(template.format_prompt(query))
+            # Generate prompt for the query
+            self.logger.debug("Selecting prompt template for query")
+            template = self.prompt_manager.get_template_for_query(query)
             
-            if not plan_response or not plan_response.strip():
-                raise ValueError("LLM returned empty response")
+            if not template:
+                error_msg = "No suitable template found for query type"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
             
-            # Parse the response into steps
-            plan_steps = self._parse_plan_response(plan_response)
+            self.logger.debug(f"Selected template type: {template.query_type.value}")
             
-            if not plan_steps:
-                raise ValueError("No valid plan steps extracted from LLM response")
+            # Generate plan using LLM
+            try:
+                prompt = template.format_prompt(query)
+                self.logger.debug("Formatted prompt for LLM",
+                                prompt_length=len(prompt))
+                
+                llm_start = asyncio.get_event_loop().time()
+                plan_response = await self.llm.generate(prompt)
+                llm_duration = (asyncio.get_event_loop().time() - llm_start) * 1000
+                
+                if not plan_response or not plan_response.strip():
+                    error_msg = "LLM returned empty response"
+                    self.logger.error(error_msg)
+                    
+                    # Log the LLM interaction failure
+                    self.logger.log_llm_interaction(
+                        operation="plan_generation",
+                        prompt_length=len(prompt),
+                        response_length=0,
+                        duration_ms=llm_duration,
+                        model_name=getattr(self.llm, 'model_name', 'unknown'),
+                        success=False,
+                        error=error_msg
+                    )
+                    
+                    raise ValueError(error_msg)
+                
+                # Log successful LLM interaction
+                self.logger.log_llm_interaction(
+                    operation="plan_generation",
+                    prompt_length=len(prompt),
+                    response_length=len(plan_response),
+                    duration_ms=llm_duration,
+                    model_name=getattr(self.llm, 'model_name', 'unknown'),
+                    success=True
+                )
+                
+                # Parse the response into steps
+                self.logger.debug("Parsing LLM response into plan steps",
+                                response_length=len(plan_response))
+                
+                plan_steps = self._parse_plan_response(plan_response)
+                
+                if not plan_steps:
+                    error_msg = "No valid plan steps extracted from LLM response"
+                    self.logger.error(error_msg,
+                                    response_preview=plan_response[:200] + "..." if len(plan_response) > 200 else plan_response)
+                    raise ValueError(error_msg)
+                
+                self.logger.info(f"Successfully generated plan",
+                               step_count=len(plan_steps),
+                               llm_duration_ms=llm_duration)
+                
+                return plan_steps
+                
+            except Exception as e:
+                self.logger.error(f"LLM plan generation failed: {str(e)}")
+                raise e
+                
+        finally:
+            self.logger.pop_context()
+    
+    def _parse_plan_response(self, response: str) -> List[str]:
+        """Parse LLM response into plan steps with detailed logging.
+        
+        Args:
+            response: Raw LLM response
             
-            return plan_steps
+        Returns:
+            List of plan steps
+        """
+        self.logger.debug("Parsing plan response",
+                        response_length=len(response),
+                        response_preview=response[:100] + "..." if len(response) > 100 else response)
+        
+        steps = []
+        lines = response.strip().split('\n')
+        
+        for line_num, line in enumerate(lines, 1):
+            line = line.strip()
             
-        except Exception as e:
-            logger.error(f"LLM plan generation failed: {str(e)}")
-            raise e
+            # Skip empty lines and common headers
+            if not line or line.lower() in ['plan:', 'steps:', 'action plan:', 'here is the plan:']:
+                continue
+            
+            # Remove numbering and bullet points
+            import re
+            cleaned_line = re.sub(r'^[\d\.\-\*\+\s]+', '', line).strip()
+            
+            if cleaned_line and len(cleaned_line) > 5:  # Meaningful step
+                steps.append(cleaned_line)
+                self.logger.debug(f"Extracted step {len(steps)}",
+                                line_number=line_num,
+                                step_content=cleaned_line[:50] + "..." if len(cleaned_line) > 50 else cleaned_line)
+        
+        self.logger.info(f"Plan parsing completed",
+                       total_lines=len(lines),
+                       extracted_steps=len(steps),
+                       success=len(steps) > 0)
+        
+        return steps
     
     async def _generate_plan(self, query: str) -> str:
         """Generate plan using the LLM.
