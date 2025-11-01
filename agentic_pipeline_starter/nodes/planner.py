@@ -1,18 +1,20 @@
-"""Planner node for generating multi-step plans using LLM.
+"""Planner node for the agentic reasoning pipeline.
 
-This module implements the PlannerNode that serves as the strategic thinking
-component of the agentic system, analyzing user queries and generating
-structured, executable plans.
+This module implements the planning component that generates structured,
+actionable plans based on user queries. It integrates with the LLM layer
+to create intelligent, context-aware planning.
 """
 
+import asyncio
+from typing import List, Optional, Dict, Any
 import logging
-from typing import Optional
 
-from ..config import get_settings
-from ..state import ConversationState
-from ..llm import BaseLLM, LLMFactory
-from .prompt_templates import QueryClassifier
-from .plan_validator import PlanValidator, PlanQuality
+from ..state.conversation_state import ConversationState
+from ..llm.base import BaseLLM
+from ..llm.factory import LLMFactory
+from .prompt_templates import PromptTemplateManager, QueryType
+from .plan_validator import PlanValidator, ValidationResult, PlanQuality
+from .error_handler import PlannerErrorHandler, CircuitBreaker, ErrorType
 
 
 logger = logging.getLogger(__name__)
@@ -36,11 +38,18 @@ class PlannerNode:
         Args:
             llm: Optional LLM instance. If None, will create based on settings.
         """
-        self.settings = get_settings()
         self.llm = llm or self._create_llm()
+        self.prompt_manager = PromptTemplateManager()
         self.validator = PlanValidator()
         
-        logger.info(f"PlannerNode initialized with {type(self.llm).__name__}")
+        # Initialize error handling and circuit breaker
+        self.error_handler = PlannerErrorHandler()
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=60.0
+        )
+        
+        logger.info(f"PlannerNode initialized with {type(self.llm).__name__} and error handling")
     
     def _create_llm(self) -> BaseLLM:
         """Create LLM instance based on configuration.
@@ -51,74 +60,139 @@ class PlannerNode:
         return LLMFactory.create_llm()
     
     async def execute(self, state: ConversationState) -> ConversationState:
-        """Execute the planning process for the given conversation state.
+        """Execute the planning phase with comprehensive error handling.
+        
+        This method generates a structured plan for the user's query,
+        validates the plan, and updates the conversation state.
         
         Args:
-            state: Current conversation state containing the user query
+            state: Current conversation state
             
         Returns:
-            Updated conversation state with generated plan
-            
-        Raises:
-            ValueError: If the query is empty or invalid
-            RuntimeError: If plan generation fails critically
+            Updated conversation state with plan
         """
+        start_time = asyncio.get_event_loop().time()
+        query = state.messages[-1].content if state.messages else ""
+        
+        logger.info(f"Starting plan generation for query: {query[:100]}...")
+        
         try:
-            logger.info(f"Starting plan generation for conversation {state.conversation_id}")
+            # Use error handler for plan generation with fallback
+            success, result = await self.error_handler.handle_with_fallback(
+                self._generate_plan_with_circuit_breaker,
+                query,
+                query
+            )
             
-            # Validate input
-            if not state.query or not state.query.strip():
-                raise ValueError("Query cannot be empty for plan generation")
+            if success:
+                plan_steps = result
+                logger.info(f"Plan generated successfully with {len(plan_steps)} steps")
+            else:
+                # Result is the fallback plan
+                plan_steps = result
+                logger.warning("Using fallback plan due to generation failures")
+                state.add_error(f"Plan generation failed, using fallback: {type(result).__name__}")
             
-            # Generate plan using LLM
-            plan_text = await self._generate_plan(state.query)
+            # Validate the plan (whether generated or fallback)
+            validation_result = await self.validator.validate_plan(plan_steps, query)
             
-            # Parse and validate the plan
-            plan_steps = self._parse_plan(plan_text)
-            validation_result = self.validator.validate_plan(plan_steps, state.query)
+            # Update state with plan and validation results
+            state.plan = plan_steps
+            state.add_metadata("plan_validation", {
+                "quality": validation_result.quality.value,
+                "score": validation_result.score,
+                "issues": validation_result.issues,
+                "suggestions": validation_result.suggestions,
+                "is_fallback": not success,
+                "generation_time": asyncio.get_event_loop().time() - start_time
+            })
             
-            # Use validated and structured steps
-            final_steps = validation_result.structured_steps
+            # Log quality assessment
+            if validation_result.quality in [PlanQuality.EXCELLENT, PlanQuality.GOOD]:
+                logger.info(f"Plan quality: {validation_result.quality.value} (score: {validation_result.score:.2f})")
+            else:
+                logger.warning(f"Plan quality: {validation_result.quality.value} (score: {validation_result.score:.2f})")
+                if validation_result.issues:
+                    logger.warning(f"Plan issues: {', '.join(validation_result.issues)}")
             
-            # Handle validation results
-            if not validation_result.is_valid:
-                logger.warning(f"Plan validation failed: {validation_result.issues}")
-                state.add_error(f"Plan validation failed: {'; '.join(validation_result.issues)}")
-                # Use fallback plan if validation fails completely
-                final_steps = self._create_fallback_plan(state.query)
-            elif validation_result.quality == PlanQuality.POOR:
-                logger.warning(f"Plan quality is poor (score: {validation_result.score})")
-                state.update_metadata("plan_quality_warning", True)
+            # Add error history summary to metadata for debugging
+            error_summary = self.error_handler.get_error_summary()
+            if error_summary["total_errors"] > 0:
+                state.add_metadata("error_summary", error_summary)
             
-            # Update state with generated plan
-            for step in final_steps:
-                state.add_plan_step(step)
-            
-            # Add comprehensive metadata
-            state.update_metadata("planner_executed", True)
-            state.update_metadata("plan_steps_count", len(final_steps))
-            state.update_metadata("plan_quality_score", validation_result.score)
-            state.update_metadata("plan_quality_level", validation_result.quality.value)
-            
-            if validation_result.issues:
-                state.update_metadata("plan_validation_issues", validation_result.issues)
-            if validation_result.suggestions:
-                state.update_metadata("plan_improvement_suggestions", validation_result.suggestions)
-            
-            logger.info(f"Successfully generated {len(final_steps)} plan steps with quality score {validation_result.score}")
-            return state
-            
-        except ValueError as e:
-            error_msg = f"Validation error in planner: {str(e)}"
-            logger.error(error_msg)
-            state.add_error(error_msg)
             return state
             
         except Exception as e:
-            error_msg = f"Unexpected error in planner: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            state.add_error(error_msg)
+            logger.error(f"Critical error in plan execution: {str(e)}", exc_info=True)
+            
+            # Add error to state
+            state.add_error(f"Critical planning error: {str(e)}")
+            
+            # Create emergency fallback plan
+            emergency_plan = [
+                "Acknowledge the user's request",
+                "Attempt to provide helpful information based on available resources"
+            ]
+            
+            state.plan = emergency_plan
+            state.add_metadata("plan_validation", {
+                "quality": "EMERGENCY",
+                "score": 0.1,
+                "issues": ["Emergency fallback used due to critical error"],
+                "suggestions": ["Manual intervention may be required"],
+                "is_fallback": True,
+                "generation_time": asyncio.get_event_loop().time() - start_time
+            })
+            
             return state
+    
+    async def _generate_plan_with_circuit_breaker(self, query: str) -> List[str]:
+        """Generate plan using circuit breaker protection.
+        
+        Args:
+            query: User query to generate plan for
+            
+        Returns:
+            Generated plan steps
+        """
+        return await self.circuit_breaker.call(self._generate_plan_internal, query)
+    
+    async def _generate_plan_internal(self, query: str) -> List[str]:
+        """Internal plan generation method.
+        
+        Args:
+            query: User query to generate plan for
+            
+        Returns:
+            Generated plan steps
+            
+        Raises:
+            Various exceptions based on failure type
+        """
+        # Generate prompt for the query
+        template = self.prompt_manager.get_template_for_query(query)
+        
+        if not template:
+            raise ValueError(f"No suitable template found for query type")
+        
+        # Generate plan using LLM
+        try:
+            plan_response = await self.llm.generate(template.format_prompt(query))
+            
+            if not plan_response or not plan_response.strip():
+                raise ValueError("LLM returned empty response")
+            
+            # Parse the response into steps
+            plan_steps = self._parse_plan_response(plan_response)
+            
+            if not plan_steps:
+                raise ValueError("No valid plan steps extracted from LLM response")
+            
+            return plan_steps
+            
+        except Exception as e:
+            logger.error(f"LLM plan generation failed: {str(e)}")
+            raise e
     
     async def _generate_plan(self, query: str) -> str:
         """Generate plan using the LLM.
@@ -158,7 +232,8 @@ class PlannerNode:
             Formatted planning prompt optimized for the query type
         """
         # Use intelligent template selection
-        template = QueryClassifier.get_template_for_query(query)
+        # Generate prompt for the query
+        template = self.prompt_manager.get_template_for_query(query)
         return template.format(query=query)
     
     def _parse_plan(self, plan_text: str) -> list[str]:
