@@ -12,6 +12,7 @@ from ..config import get_settings
 from ..state import ConversationState
 from ..llm import BaseLLM, LLMFactory
 from .prompt_templates import QueryClassifier
+from .plan_validator import PlanValidator, PlanQuality
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class PlannerNode:
         """
         self.settings = get_settings()
         self.llm = llm or self._create_llm()
+        self.validator = PlanValidator()
         
         logger.info(f"PlannerNode initialized with {type(self.llm).__name__}")
     
@@ -71,18 +73,39 @@ class PlannerNode:
             # Generate plan using LLM
             plan_text = await self._generate_plan(state.query)
             
-            # Parse and structure the plan
+            # Parse and validate the plan
             plan_steps = self._parse_plan(plan_text)
+            validation_result = self.validator.validate_plan(plan_steps, state.query)
+            
+            # Use validated and structured steps
+            final_steps = validation_result.structured_steps
+            
+            # Handle validation results
+            if not validation_result.is_valid:
+                logger.warning(f"Plan validation failed: {validation_result.issues}")
+                state.add_error(f"Plan validation failed: {'; '.join(validation_result.issues)}")
+                # Use fallback plan if validation fails completely
+                final_steps = self._create_fallback_plan(state.query)
+            elif validation_result.quality == PlanQuality.POOR:
+                logger.warning(f"Plan quality is poor (score: {validation_result.score})")
+                state.update_metadata("plan_quality_warning", True)
             
             # Update state with generated plan
-            for step in plan_steps:
+            for step in final_steps:
                 state.add_plan_step(step)
             
-            # Add metadata
+            # Add comprehensive metadata
             state.update_metadata("planner_executed", True)
-            state.update_metadata("plan_steps_count", len(plan_steps))
+            state.update_metadata("plan_steps_count", len(final_steps))
+            state.update_metadata("plan_quality_score", validation_result.score)
+            state.update_metadata("plan_quality_level", validation_result.quality.value)
             
-            logger.info(f"Successfully generated {len(plan_steps)} plan steps")
+            if validation_result.issues:
+                state.update_metadata("plan_validation_issues", validation_result.issues)
+            if validation_result.suggestions:
+                state.update_metadata("plan_improvement_suggestions", validation_result.suggestions)
+            
+            logger.info(f"Successfully generated {len(final_steps)} plan steps with quality score {validation_result.score}")
             return state
             
         except ValueError as e:
@@ -179,3 +202,32 @@ class PlannerNode:
         
         logger.debug(f"Parsed {len(steps)} steps from plan")
         return steps
+    
+    def _create_fallback_plan(self, query: str) -> List[str]:
+        """Create a fallback plan when validation fails.
+        
+        Args:
+            query: User query to create fallback plan for
+            
+        Returns:
+            Basic but valid fallback plan steps
+        """
+        logger.info("Creating fallback plan due to validation failure")
+        
+        fallback_steps = [
+            "Analyze the user's question to understand the core request.",
+            "Identify the key information needed to provide a complete answer.",
+            "Gather relevant data from appropriate and reliable sources.",
+            "Synthesize the information into a comprehensive response."
+        ]
+        
+        # Customize based on query type if possible
+        query_lower = query.lower()
+        if "math" in query_lower or "calculate" in query_lower:
+            fallback_steps[2] = "Perform the necessary calculations step by step."
+        elif "compare" in query_lower:
+            fallback_steps[2] = "Gather information about each option being compared."
+        elif "how to" in query_lower:
+            fallback_steps[2] = "Research the step-by-step process or instructions."
+        
+        return fallback_steps
