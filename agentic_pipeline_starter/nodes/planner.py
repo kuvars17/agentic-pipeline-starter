@@ -11,6 +11,7 @@ from typing import Optional
 from ..config import get_settings
 from ..state import ConversationState
 from ..llm import BaseLLM, LLMFactory
+from .prompt_templates import QueryClassifier
 
 
 logger = logging.getLogger(__name__)
@@ -125,29 +126,17 @@ class PlannerNode:
             raise RuntimeError(f"Plan generation failed: {str(e)}")
     
     def _create_planning_prompt(self, query: str) -> str:
-        """Create planning prompt for the LLM.
+        """Create planning prompt for the LLM using intelligent templates.
         
         Args:
             query: User query to create prompt for
             
         Returns:
-            Formatted planning prompt
+            Formatted planning prompt optimized for the query type
         """
-        prompt = f"""You are an expert AI planning assistant. Your task is to create a clear, actionable plan to answer the user's query.
-
-User Query: "{query}"
-
-Please create a step-by-step plan to answer this query. The plan should be:
-1. Specific and actionable
-2. Logically ordered
-3. Comprehensive but concise
-4. Focused on gathering information and providing an accurate answer
-
-Format your response as a numbered list of steps. Each step should be a clear action that can be executed.
-
-Plan:"""
-        
-        return prompt
+        # Use intelligent template selection
+        template = QueryClassifier.get_template_for_query(query)
+        return template.format(query=query)
     
     def _parse_plan(self, plan_text: str) -> list[str]:
         """Parse plan text into structured steps.
