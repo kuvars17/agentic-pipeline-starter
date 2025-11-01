@@ -11,8 +11,7 @@ import logging
 
 from ..state.conversation_state import ConversationState
 from ..llm.base import BaseLLM
-from ..llm.factory import LLMFactory
-from .prompt_templates import PromptTemplateManager, QueryType
+from .prompt_templates import PlanningPrompts, QueryClassifier, QueryType
 from .plan_validator import PlanValidator, ValidationResult, PlanQuality
 from .error_handler import PlannerErrorHandler, CircuitBreaker, ErrorType
 from .planner_logger import PlannerLogger, LogContext, ComponentType, performance_monitor
@@ -50,7 +49,7 @@ class PlannerNode:
         
         try:
             self.llm = llm or self._create_llm()
-            self.prompt_manager = PromptTemplateManager()
+            self.planning_prompts = PlanningPrompts()
             self.validator = PlanValidator()
             
             # Initialize error handling and circuit breaker
@@ -78,9 +77,11 @@ class PlannerNode:
         """Create LLM instance based on configuration.
         
         Returns:
-            Configured LLM instance
+            LLM instance
         """
-        return LLMFactory.create_llm()
+        # Import here to avoid circular imports
+        from ..llm.factory import LLMFactory
+        return LLMFactory.create_llm("mock")
     
     @performance_monitor("plan_execution")
     async def execute(self, state: ConversationState) -> ConversationState:
@@ -135,7 +136,7 @@ class PlannerNode:
             
             # Validate the plan (whether generated or fallback)
             validation_start = asyncio.get_event_loop().time()
-            validation_result = await self.validator.validate_plan(plan_steps, query)
+            validation_result = self.validator.validate_plan(plan_steps, query)
             validation_duration = (asyncio.get_event_loop().time() - validation_start) * 1000
             
             # Log validation results
@@ -278,14 +279,14 @@ class PlannerNode:
         try:
             # Generate prompt for the query
             self.logger.debug("Selecting prompt template for query")
-            template = self.prompt_manager.get_template_for_query(query)
+            template = QueryClassifier.get_template_for_query(query)
             
             if not template:
                 error_msg = "No suitable template found for query type"
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
             
-            self.logger.debug(f"Selected template type: {template.query_type.value}")
+            self.logger.debug(f"Selected template: {template.system_prompt[:50]}...")
             
             # Generate plan using LLM
             try:

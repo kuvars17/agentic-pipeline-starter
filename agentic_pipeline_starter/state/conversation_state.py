@@ -11,6 +11,19 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, Field, validator
 
 
+class Message(BaseModel):
+    """Individual message in the conversation.
+    
+    Attributes:
+        role: Role of the message sender (user, assistant, system)
+        content: Content of the message
+        timestamp: When the message was created
+    """
+    role: str = Field(..., description="Role of the message sender")
+    content: str = Field(..., description="Content of the message")
+    timestamp: datetime = Field(default_factory=datetime.utcnow, description="Message timestamp")
+
+
 class ConversationState(BaseModel):
     """Core conversation state that tracks the agentic reasoning process.
     
@@ -39,10 +52,15 @@ class ConversationState(BaseModel):
     
     # User input
     query: str = Field(
-        ...,
+        default="",
         description="The original user query or question",
-        min_length=1,
         max_length=10000
+    )
+    
+    # Messages in the conversation
+    messages: List[Message] = Field(
+        default_factory=list,
+        description="List of messages in the conversation"
     )
     
     # Processing stages
@@ -94,7 +112,7 @@ class ConversationState(BaseModel):
             datetime: lambda v: v.isoformat(),
             UUID: lambda v: str(v)
         }
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "conversation_id": "123e4567-e89b-12d3-a456-426614174000",
                 "query": "What is the capital of Germany?",
@@ -137,6 +155,18 @@ class ConversationState(BaseModel):
     def update_timestamp(cls, v: datetime, values: Dict[str, Any]) -> datetime:
         """Always update the timestamp when the model is modified."""
         return datetime.utcnow()
+    
+    def add_message(self, message: Message) -> None:
+        """Add a message to the conversation.
+        
+        Args:
+            message: Message to add to the conversation
+        """
+        self.messages.append(message)
+        # Update query if it's a user message and no query set
+        if message.role == "user" and not self.query:
+            self.query = message.content
+        self.updated_at = datetime.utcnow()
     
     def add_plan_step(self, step: str) -> None:
         """Add a new step to the plan.
@@ -194,6 +224,25 @@ class ConversationState(BaseModel):
             value: Metadata value
         """
         self.metadata[key] = value
+        self.updated_at = datetime.utcnow()
+    
+    def add_metadata(self, key: str, value: Any) -> None:
+        """Add metadata to the conversation state.
+        
+        Args:
+            key: Metadata key
+            value: Metadata value
+        """
+        self.metadata[key] = value
+        self.updated_at = datetime.utcnow()
+    
+    def update_metadata(self, updates: Dict[str, Any]) -> None:
+        """Update multiple metadata fields at once.
+        
+        Args:
+            updates: Dictionary of metadata updates
+        """
+        self.metadata.update(updates)
         self.updated_at = datetime.utcnow()
     
     def is_complete(self) -> bool:
