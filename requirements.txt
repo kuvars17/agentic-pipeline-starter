@@ -1,0 +1,28 @@
+# Agentic Pipeline Starter - Production Dependencies
+# Core dependencies required to run the agentic AI pipeline
+
+# Core Framework
+fastapi>=0.104.0,<1.0.0
+uvicorn[standard]>=0.24.0,<1.0.0
+
+# Pydantic and Settings
+pydantic>=2.5.0,<3.0.0
+pydantic-settings>=2.1.0,<3.0.0
+
+# LangGraph and LangChain
+langgraph>=0.2.0,<1.0.0
+langchain-core>=0.3.0,<1.0.0
+
+# HTTP Client and Async Support
+httpx>=0.25.0,<1.0.0
+aiofiles>=23.2.0,<24.0.0
+
+# Ollama Integration
+ollama>=0.3.0,<1.0.0
+
+# Math and Utilities
+sympy>=1.12.0,<2.0.0
+
+# Logging and Observability
+rich>=13.7.0,<14.0.0
+structlog>=23.2.0,<24.0.0

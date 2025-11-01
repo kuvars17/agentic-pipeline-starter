@@ -1,0 +1,1 @@
+"""LLM abstraction layer for Ollama and Mock implementations."""

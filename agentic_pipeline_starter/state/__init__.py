@@ -1,0 +1,1 @@
+"""Conversation state management using Pydantic models."""
