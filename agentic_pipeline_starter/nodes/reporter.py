@@ -336,17 +336,51 @@ class ReporterNode:
             verdict_info["has_verdict"] = True
             verdict_info["verdict_content"] = str(state.verdict)
             
-            # Extract confidence score if available
+            # Extract confidence score from multiple sources
+            confidence_score = 0.0
+            
+            # Check state-level confidence
             if hasattr(state, 'confidence_score'):
-                verdict_info["confidence_score"] = state.confidence_score
-                
-                # Map confidence score to level
-                if state.confidence_score >= 0.8:
-                    verdict_info["verdict_confidence"] = ConfidenceLevel.HIGH
-                elif state.confidence_score >= 0.5:
-                    verdict_info["verdict_confidence"] = ConfidenceLevel.MEDIUM
-                else:
-                    verdict_info["verdict_confidence"] = ConfidenceLevel.LOW
+                confidence_score = state.confidence_score
+            
+            # Check verdict object confidence (if verdict is an object)
+            elif hasattr(state.verdict, 'confidence'):
+                confidence_score = state.verdict.confidence
+            elif hasattr(state.verdict, 'confidence_score'):
+                confidence_score = state.verdict.confidence_score
+            
+            # Check metadata for confidence information
+            elif hasattr(state, 'metadata') and state.metadata:
+                confidence_score = state.metadata.get('confidence_score', 0.0)
+                if not confidence_score:
+                    # Look for judge-related confidence
+                    judge_meta = state.metadata.get('judge_execution', {})
+                    confidence_score = judge_meta.get('confidence_score', 0.0)
+            
+            verdict_info["confidence_score"] = confidence_score
+            
+            # Map confidence score to level with enhanced thresholds
+            if confidence_score >= 0.85:
+                verdict_info["verdict_confidence"] = ConfidenceLevel.HIGH
+            elif confidence_score >= 0.6:
+                verdict_info["verdict_confidence"] = ConfidenceLevel.MEDIUM
+            elif confidence_score >= 0.3:
+                verdict_info["verdict_confidence"] = ConfidenceLevel.LOW
+            else:
+                verdict_info["verdict_confidence"] = ConfidenceLevel.UNKNOWN
+            
+            # Extract reasoning from verdict if available
+            reasoning = []
+            if hasattr(state.verdict, 'reasoning'):
+                reasoning = state.verdict.reasoning
+            elif hasattr(state.verdict, 'explanation'):
+                reasoning = [state.verdict.explanation]
+            elif hasattr(state, 'metadata') and state.metadata:
+                judge_meta = state.metadata.get('judge_execution', {})
+                if 'reasoning' in judge_meta:
+                    reasoning = judge_meta['reasoning']
+            
+            verdict_info["reasoning"] = reasoning
         
         self.logger.info(
             f"Extracted verdict information: has_verdict={verdict_info['has_verdict']}, "
@@ -693,7 +727,7 @@ Mock detailed technical analysis completed with {len(sections)} sections.
         verdict_info: Dict[str, Any]
     ) -> ConfidenceLevel:
         """
-        Calculate overall confidence level from all components.
+        Calculate overall confidence level from all components with enhanced Judge integration.
         
         Args:
             plan_info: Plan information
@@ -704,6 +738,7 @@ Mock detailed technical analysis completed with {len(sections)} sections.
             Overall confidence level
         """
         confidence_scores = []
+        weights = []
         
         # Map confidence levels to numeric scores
         level_scores = {
@@ -713,7 +748,134 @@ Mock detailed technical analysis completed with {len(sections)} sections.
             ConfidenceLevel.UNKNOWN: 0.1
         }
         
-        # Add component confidence scores
+        # Add component confidence scores with weights
+        
+        # Plan confidence (weight: 0.2)
+        if plan_info["has_plan"]:
+            confidence_scores.append(level_scores[plan_info["plan_confidence"]])
+            weights.append(0.2)
+        
+        # Evidence confidence (weight: 0.3)
+        if evidence_info["has_evidence"]:
+            evidence_score = level_scores[evidence_info["evidence_confidence"]]
+            
+            # Boost confidence based on evidence quantity and diversity
+            evidence_count = evidence_info.get("evidence_count", 0)
+            tools_count = len(evidence_info.get("tools_used", []))
+            
+            if evidence_count >= 5 and tools_count >= 2:
+                evidence_score = min(1.0, evidence_score + 0.1)
+            elif evidence_count >= 3:
+                evidence_score = min(1.0, evidence_score + 0.05)
+            
+            confidence_scores.append(evidence_score)
+            weights.append(0.3)
+        
+        # Verdict confidence (weight: 0.5 - highest weight)
+        if verdict_info["has_verdict"]:
+            # Use actual confidence score from Judge if available
+            judge_confidence = verdict_info.get("confidence_score", 0.0)
+            
+            if judge_confidence > 0:
+                # Use judge's actual confidence score
+                confidence_scores.append(judge_confidence)
+            else:
+                # Fallback to level-based score
+                confidence_scores.append(level_scores[verdict_info["verdict_confidence"]])
+            
+            weights.append(0.5)
+            
+            # Additional boost if reasoning is available
+            if verdict_info.get("reasoning"):
+                reasoning_count = len(verdict_info["reasoning"])
+                if reasoning_count >= 3:
+                    confidence_scores[-1] = min(1.0, confidence_scores[-1] + 0.05)
+        
+        # Calculate weighted average confidence
+        if confidence_scores and weights:
+            weighted_sum = sum(score * weight for score, weight in zip(confidence_scores, weights))
+            total_weight = sum(weights)
+            avg_confidence = weighted_sum / total_weight
+            
+            # Apply threshold filtering based on minimum confidence
+            if avg_confidence < self.min_confidence_threshold:
+                self.logger.warning(
+                    f"Overall confidence {avg_confidence:.2f} below threshold {self.min_confidence_threshold}"
+                )
+                return ConfidenceLevel.LOW
+            
+            # Map to confidence levels with enhanced thresholds
+            if avg_confidence >= 0.85:
+                return ConfidenceLevel.HIGH
+            elif avg_confidence >= 0.6:
+                return ConfidenceLevel.MEDIUM
+            elif avg_confidence >= 0.3:
+                return ConfidenceLevel.LOW
+            else:
+                return ConfidenceLevel.UNKNOWN
+        
+        self.logger.warning("No confidence information available for calculation")
+        return ConfidenceLevel.UNKNOWN
+    
+    def get_confidence_breakdown(
+        self,
+        plan_info: Dict[str, Any],
+        evidence_info: Dict[str, Any],
+        verdict_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Get detailed breakdown of confidence calculation for transparency.
+        
+        Args:
+            plan_info: Plan information
+            evidence_info: Evidence information
+            verdict_info: Verdict information
+            
+        Returns:
+            Detailed confidence breakdown
+        """
+        breakdown = {
+            "components": {},
+            "overall": self._calculate_overall_confidence(plan_info, evidence_info, verdict_info).value,
+            "factors": []
+        }
+        
+        # Plan component
+        if plan_info["has_plan"]:
+            breakdown["components"]["plan"] = {
+                "confidence": plan_info["plan_confidence"].value,
+                "steps_count": len(plan_info.get("plan_steps", [])),
+                "weight": 0.2
+            }
+            breakdown["factors"].append("Structured plan available")
+        
+        # Evidence component
+        if evidence_info["has_evidence"]:
+            breakdown["components"]["evidence"] = {
+                "confidence": evidence_info["evidence_confidence"].value,
+                "evidence_count": evidence_info.get("evidence_count", 0),
+                "tools_used": evidence_info.get("tools_used", []),
+                "weight": 0.3
+            }
+            breakdown["factors"].append(f"{evidence_info.get('evidence_count', 0)} evidence items")
+        
+        # Verdict component  
+        if verdict_info["has_verdict"]:
+            breakdown["components"]["verdict"] = {
+                "confidence": verdict_info["verdict_confidence"].value,
+                "confidence_score": verdict_info.get("confidence_score", 0.0),
+                "has_reasoning": bool(verdict_info.get("reasoning")),
+                "weight": 0.5
+            }
+            breakdown["factors"].append("Judge verdict available")
+        
+        # Threshold check
+        breakdown["threshold"] = {
+            "minimum": self.min_confidence_threshold,
+            "meets_threshold": breakdown["overall"] != "low"
+        }
+        
+        return breakdown
         if plan_info["has_plan"]:
             confidence_scores.append(level_scores[plan_info["plan_confidence"]])
         
