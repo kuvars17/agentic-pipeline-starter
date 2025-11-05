@@ -21,6 +21,7 @@ from enum import Enum
 from ..state.conversation_state import ConversationState, Message
 from ..llm.base import BaseLLM
 from ..tools.http_fetch import HttpFetchTool, HttpRequest, HttpMethod, HttpError
+from ..tools.safe_math import SafeMathTool, MathResult, MathError
 
 
 class ToolType(Enum):
@@ -107,9 +108,17 @@ class ToolboxNode:
             retry_delay=retry_delay
         )
         
+        # Initialize safe math tool
+        self.math_tool = SafeMathTool(
+            precision=28,
+            max_iterations=max_retries * 100,
+            enable_functions=True
+        )
+        
         # Tool registry
         self.tools: Dict[ToolType, Any] = {
-            ToolType.HTTP_FETCH: self.http_tool
+            ToolType.HTTP_FETCH: self.http_tool,
+            ToolType.SAFE_MATH: self.math_tool
         }
         
         self.logger.info(
@@ -446,7 +455,7 @@ class ToolboxNode:
     
     async def _execute_math_step(self, step: Dict[str, Any]) -> ToolResult:
         """
-        Execute math calculation step (placeholder).
+        Execute math calculation step using SafeMathTool.
         
         Args:
             step: Math step configuration
@@ -461,26 +470,51 @@ class ToolboxNode:
             params = step.get("params", {})
             expression = params.get("expression", "")
             
-            # Placeholder for safe math evaluation
-            # This will be implemented in the next task
-            result = f"Math calculation for: {expression} (placeholder)"
+            if not expression:
+                raise ValueError("No expression provided for math calculation")
+            
+            # Execute safe math calculation
+            math_result = self.math_tool.calculate(expression)
             
             execution_time = time.time() - start_time
+            
+            if math_result.error_message:
+                return ToolResult(
+                    tool_type=ToolType.SAFE_MATH,
+                    status=ToolExecutionStatus.FAILURE,
+                    data=None,
+                    error_message=math_result.error_message,
+                    execution_time=execution_time
+                )
             
             return ToolResult(
                 tool_type=ToolType.SAFE_MATH,
                 status=ToolExecutionStatus.SUCCESS,
-                data={"expression": expression, "result": result},
+                data={
+                    "expression": math_result.expression,
+                    "result": math_result.result,
+                    "operations_used": math_result.operations_used,
+                    "precision": math_result.precision
+                },
                 execution_time=execution_time
             )
             
+        except MathError as e:
+            execution_time = time.time() - start_time
+            return ToolResult(
+                tool_type=ToolType.SAFE_MATH,
+                status=ToolExecutionStatus.FAILURE,
+                data=None,
+                error_message=f"Math error: {str(e)}",
+                execution_time=execution_time
+            )
         except Exception as e:
             execution_time = time.time() - start_time
             return ToolResult(
                 tool_type=ToolType.SAFE_MATH,
                 status=ToolExecutionStatus.FAILURE,
                 data=None,
-                error_message=str(e),
+                error_message=f"Unexpected error: {str(e)}",
                 execution_time=execution_time
             )
     

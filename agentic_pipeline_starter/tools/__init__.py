@@ -10,11 +10,16 @@ Version: 1.0.0
 """
 
 from .http_fetch import HttpFetchTool, HttpRequest, HttpResponse, HttpMethod, HttpError
+from .safe_math import SafeMathTool, MathResult, MathOperation, MathError
 
 __all__ = [
     "HttpFetchTool",
     "HttpRequest", 
     "HttpResponse",
     "HttpMethod",
-    "HttpError"
+    "HttpError",
+    "SafeMathTool",
+    "MathResult",
+    "MathOperation", 
+    "MathError"
 ]
