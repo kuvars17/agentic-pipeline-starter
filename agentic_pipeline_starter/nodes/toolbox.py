@@ -12,12 +12,15 @@ Version: 1.0.0
 
 import asyncio
 import logging
+import json
+import re
 from typing import Dict, List, Any, Optional, Union
 from dataclasses import dataclass
 from enum import Enum
 
 from ..state.conversation_state import ConversationState, Message
 from ..llm.base import BaseLLM
+from ..tools.http_fetch import HttpFetchTool, HttpRequest, HttpMethod, HttpError
 
 
 class ToolType(Enum):
@@ -97,8 +100,17 @@ class ToolboxNode:
         self.concurrent_tools = concurrent_tools
         self.logger = logging.getLogger(__name__)
         
-        # Tool registry - will be populated in subsequent implementations
-        self.tools: Dict[ToolType, Any] = {}
+        # Initialize HTTP fetch tool
+        self.http_tool = HttpFetchTool(
+            default_timeout=http_timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay
+        )
+        
+        # Tool registry
+        self.tools: Dict[ToolType, Any] = {
+            ToolType.HTTP_FETCH: self.http_tool
+        }
         
         self.logger.info(
             f"ToolboxNode initialized with timeout={http_timeout}s, "
@@ -178,24 +190,113 @@ class ToolboxNode:
         Returns:
             List of plan steps with tool information
         """
-        # Placeholder implementation - will be enhanced
-        # This should parse the plan and identify tool requirements
         steps = []
         
-        # Basic plan parsing (to be improved)
-        if "http" in plan.lower() or "fetch" in plan.lower():
+        # Extract HTTP requests from plan
+        http_steps = self._extract_http_requests(plan)
+        steps.extend(http_steps)
+        
+        # Extract math calculations from plan
+        math_steps = self._extract_math_operations(plan)
+        steps.extend(math_steps)
+        
+        self.logger.info(f"Extracted {len(steps)} executable steps from plan")
+        return steps
+    
+    def _extract_http_requests(self, plan: str) -> List[Dict[str, Any]]:
+        """
+        Extract HTTP requests from plan text.
+        
+        Args:
+            plan: Plan string to parse
+            
+        Returns:
+            List of HTTP request steps
+        """
+        steps = []
+        
+        # URL patterns
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        urls = re.findall(url_pattern, plan)
+        
+        for url in urls:
+            # Determine HTTP method from context
+            method = HttpMethod.GET
+            if any(keyword in plan.lower() for keyword in ['post', 'submit', 'send']):
+                method = HttpMethod.POST
+            elif any(keyword in plan.lower() for keyword in ['put', 'update']):
+                method = HttpMethod.PUT
+            elif any(keyword in plan.lower() for keyword in ['delete', 'remove']):
+                method = HttpMethod.DELETE
+            
             steps.append({
                 "type": "http_fetch",
                 "action": "fetch_data",
-                "params": {"url": "placeholder_url"}
+                "params": {
+                    "url": url.rstrip('.,;'),  # Clean trailing punctuation
+                    "method": method.value,
+                    "headers": {"User-Agent": "Agentic-Pipeline/1.0"}
+                }
             })
         
-        if "math" in plan.lower() or "calculate" in plan.lower():
-            steps.append({
-                "type": "safe_math",
-                "action": "calculate",
-                "params": {"expression": "placeholder_expression"}
-            })
+        # Also look for explicit fetch/API instructions
+        fetch_patterns = [
+            r'fetch (?:data from |from )?(.+)',
+            r'get (?:data from |from )?(.+)',
+            r'call (?:the )?API (?:at )?(.+)',
+            r'request (?:data from )?(.+)'
+        ]
+        
+        for pattern in fetch_patterns:
+            matches = re.findall(pattern, plan, re.IGNORECASE)
+            for match in matches:
+                # Try to extract URL from the match
+                url_in_match = re.search(url_pattern, match)
+                if url_in_match:
+                    url = url_in_match.group()
+                    steps.append({
+                        "type": "http_fetch",
+                        "action": "fetch_data",
+                        "params": {
+                            "url": url.rstrip('.,;'),
+                            "method": "GET",
+                            "headers": {"User-Agent": "Agentic-Pipeline/1.0"}
+                        }
+                    })
+        
+        return steps
+    
+    def _extract_math_operations(self, plan: str) -> List[Dict[str, Any]]:
+        """
+        Extract mathematical operations from plan text.
+        
+        Args:
+            plan: Plan string to parse
+            
+        Returns:
+            List of math operation steps
+        """
+        steps = []
+        
+        # Math operation patterns
+        math_patterns = [
+            r'calculate (.+)',
+            r'compute (.+)',
+            r'find (?:the )?(?:sum|average|total|result) (?:of )?(.+)',
+            r'(?:add|subtract|multiply|divide) (.+)',
+            r'(\d+(?:\.\d+)?\s*[+\-*/]\s*\d+(?:\.\d+)?(?:\s*[+\-*/]\s*\d+(?:\.\d+)?)*)'
+        ]
+        
+        for pattern in math_patterns:
+            matches = re.findall(pattern, plan, re.IGNORECASE)
+            for match in matches:
+                steps.append({
+                    "type": "safe_math",
+                    "action": "calculate",
+                    "params": {
+                        "expression": match.strip()
+                    }
+                })
         
         return steps
     
@@ -262,17 +363,125 @@ class ToolboxNode:
         async with semaphore:
             tool_type = ToolType(step["type"])
             
-            # Placeholder tool execution - will be implemented
             self.logger.info(f"Executing step with tool: {tool_type.value}")
             
-            # Simulate tool execution (to be replaced with actual implementation)
-            await asyncio.sleep(0.1)
+            try:
+                if tool_type == ToolType.HTTP_FETCH:
+                    return await self._execute_http_step(step)
+                elif tool_type == ToolType.SAFE_MATH:
+                    return await self._execute_math_step(step)
+                else:
+                    raise ValueError(f"Unknown tool type: {tool_type.value}")
+                    
+            except Exception as e:
+                self.logger.error(f"Tool execution failed: {str(e)}")
+                return ToolResult(
+                    tool_type=tool_type,
+                    status=ToolExecutionStatus.FAILURE,
+                    data=None,
+                    error_message=str(e)
+                )
+    
+    async def _execute_http_step(self, step: Dict[str, Any]) -> ToolResult:
+        """
+        Execute HTTP fetch step.
+        
+        Args:
+            step: HTTP step configuration
+            
+        Returns:
+            Tool execution result
+        """
+        import time
+        start_time = time.time()
+        
+        try:
+            params = step.get("params", {})
+            
+            # Create HTTP request
+            request = self.http_tool.create_request(
+                url=params["url"],
+                method=params.get("method", "GET"),
+                headers=params.get("headers", {}),
+                data=params.get("data"),
+                params=params.get("query_params")
+            )
+            
+            # Execute request
+            response = await self.http_tool.fetch(request)
+            
+            execution_time = time.time() - start_time
             
             return ToolResult(
-                tool_type=tool_type,
+                tool_type=ToolType.HTTP_FETCH,
                 status=ToolExecutionStatus.SUCCESS,
-                data={"result": f"placeholder_result_for_{tool_type.value}"},
-                execution_time=0.1
+                data={
+                    "url": response.url,
+                    "status_code": response.status_code,
+                    "data": response.data,
+                    "headers": response.headers
+                },
+                execution_time=execution_time,
+                retry_count=response.retry_count
+            )
+            
+        except HttpError as e:
+            execution_time = time.time() - start_time
+            return ToolResult(
+                tool_type=ToolType.HTTP_FETCH,
+                status=ToolExecutionStatus.FAILURE,
+                data=None,
+                error_message=f"HTTP error: {str(e)}",
+                execution_time=execution_time
+            )
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return ToolResult(
+                tool_type=ToolType.HTTP_FETCH,
+                status=ToolExecutionStatus.FAILURE,
+                data=None,
+                error_message=f"Unexpected error: {str(e)}",
+                execution_time=execution_time
+            )
+    
+    async def _execute_math_step(self, step: Dict[str, Any]) -> ToolResult:
+        """
+        Execute math calculation step (placeholder).
+        
+        Args:
+            step: Math step configuration
+            
+        Returns:
+            Tool execution result
+        """
+        import time
+        start_time = time.time()
+        
+        try:
+            params = step.get("params", {})
+            expression = params.get("expression", "")
+            
+            # Placeholder for safe math evaluation
+            # This will be implemented in the next task
+            result = f"Math calculation for: {expression} (placeholder)"
+            
+            execution_time = time.time() - start_time
+            
+            return ToolResult(
+                tool_type=ToolType.SAFE_MATH,
+                status=ToolExecutionStatus.SUCCESS,
+                data={"expression": expression, "result": result},
+                execution_time=execution_time
+            )
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            return ToolResult(
+                tool_type=ToolType.SAFE_MATH,
+                status=ToolExecutionStatus.FAILURE,
+                data=None,
+                error_message=str(e),
+                execution_time=execution_time
             )
     
     def _update_state_with_evidence(
