@@ -19,6 +19,7 @@ from datetime import datetime
 
 from ..state.conversation_state import ConversationState, Message
 from ..llm.base import BaseLLM
+from .report_templates import ReportPromptTemplates, ReportFormatter
 
 
 class ReportType(Enum):
@@ -106,8 +107,19 @@ class ReporterNode:
         self.deterministic_mode = deterministic_mode
         self.logger = logging.getLogger(__name__)
         
-        # Report templates - will be populated in subsequent implementations
-        self.templates: Dict[ReportType, str] = {}
+        # Initialize report templates
+        self.templates = {
+            ReportType.COMPREHENSIVE: ReportPromptTemplates.get_comprehensive_template(),
+            ReportType.SUMMARY: ReportPromptTemplates.get_summary_template(),
+            ReportType.DETAILED: ReportPromptTemplates.get_detailed_template(),
+            ReportType.MINIMAL: ReportPromptTemplates.get_minimal_template()
+        }
+        
+        # Error recovery template
+        self.error_template = ReportPromptTemplates.get_error_recovery_template()
+        
+        # Report formatter
+        self.formatter = ReportFormatter()
         
         # Mock responses for deterministic testing
         self.mock_responses: Dict[str, str] = {}
@@ -479,27 +491,84 @@ class ReporterNode:
         Returns:
             Mock answer string
         """
-        # Generate deterministic answer based on state content
-        answer_parts = []
+        self.logger.info("Generating deterministic mock answer for testing")
         
-        if sections:
-            answer_parts.append("Based on the analysis:")
-            for i, section in enumerate(sections, 1):
-                answer_parts.append(f"{i}. {section.title}: {section.content[:100]}...")
-        else:
-            answer_parts.append("Analysis completed with limited information.")
+        # Extract information for consistent mock generation
+        plan_info = self._extract_plan_information(state)
+        evidence_info = self._extract_evidence_information(state)
+        verdict_info = self._extract_verdict_information(state)
         
-        if hasattr(state, 'messages') and state.messages:
-            original_query = state.messages[0].content if state.messages else "the query"
-            answer_parts.append(f"\nIn response to {original_query[:50]}...")
+        # Format using the same formatter
+        original_query = self.formatter.extract_original_query(state)
+        plan_summary = self.formatter.format_plan_summary(plan_info)
+        evidence_summary = self.formatter.format_evidence_summary(evidence_info)
+        verdict_summary = self.formatter.format_verdict_summary(verdict_info)
         
-        answer_parts.append("\nThis is a deterministic mock response for testing purposes.")
+        # Generate deterministic answer based on report type
+        if self.default_report_type == ReportType.COMPREHENSIVE:
+            mock_answer = f"""## Summary
+Mock comprehensive analysis for: {original_query[:100]}
+
+## Analysis
+{plan_summary}
+
+## Evidence
+{evidence_summary}
+
+## Assessment
+{verdict_summary}
+
+## Conclusion
+This is a deterministic mock response for testing purposes. The analysis included {len(sections)} report sections with structured information synthesis."""
+
+        elif self.default_report_type == ReportType.SUMMARY:
+            mock_answer = f"""Mock summary: {original_query[:100]}
+
+Analysis completed with {evidence_info.get('evidence_count', 0)} evidence items and {len(plan_info.get('plan_steps', []))} plan steps.
+
+{verdict_summary}
+
+[Deterministic test response]"""
+
+        elif self.default_report_type == ReportType.DETAILED:
+            mock_answer = f"""# Technical Report: Mock Analysis
+
+## Executive Summary
+{original_query[:150]}
+
+## Methodology
+{plan_summary}
+
+## Findings
+{evidence_summary}
+Tools: {', '.join(evidence_info.get('tools_used', []))}
+
+## Assessment
+{verdict_summary}
+
+## Conclusions
+Mock detailed technical analysis completed with {len(sections)} sections.
+
+[Deterministic test response]"""
+
+        else:  # MINIMAL
+            mock_answer = f"Mock answer: {original_query[:50]}. {evidence_info.get('evidence_count', 0)} evidence items analyzed. [Test response]"
         
-        return "\n".join(answer_parts)
+        # Apply length validation
+        mock_answer = self.formatter.validate_response_length(mock_answer, self.max_answer_length)
+        
+        # Add confidence indicator
+        if self.include_reasoning:
+            overall_confidence = self._calculate_overall_confidence(
+                plan_info, evidence_info, verdict_info
+            )
+            mock_answer = self.formatter.add_confidence_indicator(mock_answer, overall_confidence)
+        
+        return mock_answer
     
     async def _generate_llm_answer(self, state: ConversationState, sections: List[ReportSection]) -> str:
         """
-        Generate LLM-based answer synthesis (placeholder).
+        Generate LLM-based answer synthesis using proper templates.
         
         Args:
             state: Conversation state
@@ -508,24 +577,114 @@ class ReporterNode:
         Returns:
             LLM-generated answer
         """
-        # Placeholder for LLM integration - will be implemented in next task
-        self.logger.info("Generating LLM-based answer synthesis")
+        self.logger.info(f"Generating LLM-based answer using {self.default_report_type.value} template")
         
-        # Basic prompt construction
-        prompt_parts = ["Please synthesize a comprehensive answer based on:"]
-        
-        for section in sections:
-            prompt_parts.append(f"- {section.title}: {section.content}")
-        
-        prompt = "\n".join(prompt_parts)
-        
-        # Use LLM to generate response
         try:
+            # Extract information for template
+            plan_info = self._extract_plan_information(state)
+            evidence_info = self._extract_evidence_information(state)
+            verdict_info = self._extract_verdict_information(state)
+            
+            # Format information using templates
+            original_query = self.formatter.extract_original_query(state)
+            plan_summary = self.formatter.format_plan_summary(plan_info)
+            evidence_summary = self.formatter.format_evidence_summary(evidence_info)
+            verdict_summary = self.formatter.format_verdict_summary(verdict_info)
+            
+            # Get appropriate template
+            template = self.templates.get(self.default_report_type)
+            if not template:
+                raise ValueError(f"No template found for report type: {self.default_report_type.value}")
+            
+            # Prepare template variables
+            template_vars = {
+                "original_query": original_query,
+                "plan_summary": plan_summary,
+                "evidence_summary": evidence_summary,
+                "verdict_summary": verdict_summary,
+                "max_length": self.max_answer_length
+            }
+            
+            # Add additional variables for detailed template
+            if self.default_report_type == ReportType.DETAILED:
+                template_vars.update({
+                    "tools_used": self.formatter.format_tools_used(evidence_info),
+                    "confidence_score": verdict_info.get("confidence_score", 0.0)
+                })
+            
+            # Format prompt using template
+            prompt = template.format(**template_vars)
+            
+            self.logger.debug(f"Generated prompt length: {len(prompt)} characters")
+            
+            # Use LLM to generate response
             response = await self.llm.generate(prompt)
-            return response.strip()
+            
+            if not response:
+                raise ValueError("LLM returned empty response")
+            
+            # Validate and format response
+            formatted_response = self.formatter.validate_response_length(
+                response.strip(), self.max_answer_length
+            )
+            
+            # Add confidence indicator if requested
+            if self.include_reasoning:
+                overall_confidence = self._calculate_overall_confidence(
+                    plan_info, evidence_info, verdict_info
+                )
+                formatted_response = self.formatter.add_confidence_indicator(
+                    formatted_response, overall_confidence
+                )
+            
+            self.logger.info(f"Successfully generated LLM response: {len(formatted_response.split())} words")
+            return formatted_response
+            
         except Exception as e:
             self.logger.error(f"LLM generation failed: {str(e)}")
-            return f"LLM synthesis failed. Fallback summary: {len(sections)} sections analyzed."
+            
+            # Try error recovery template
+            try:
+                return await self._generate_error_recovery_answer(state, str(e))
+            except Exception as recovery_error:
+                self.logger.error(f"Error recovery also failed: {str(recovery_error)}")
+                return f"LLM synthesis failed: {str(e)}. Fallback summary: {len(sections)} sections analyzed."
+    
+    async def _generate_error_recovery_answer(self, state: ConversationState, error_msg: str) -> str:
+        """
+        Generate answer using error recovery template.
+        
+        Args:
+            state: Conversation state
+            error_msg: Error message
+            
+        Returns:
+            Error recovery answer
+        """
+        self.logger.info("Generating error recovery answer")
+        
+        # Extract partial information
+        plan_info = self._extract_plan_information(state)
+        evidence_info = self._extract_evidence_information(state)
+        verdict_info = self._extract_verdict_information(state)
+        
+        # Format for error recovery
+        original_query = self.formatter.extract_original_query(state)
+        partial_info = self.formatter.format_partial_info(plan_info, evidence_info, verdict_info)
+        
+        # Use error recovery template
+        template_vars = {
+            "original_query": original_query,
+            "error_message": error_msg,
+            "partial_info": partial_info,
+            "max_length": min(self.max_answer_length, 500)  # Shorter for error recovery
+        }
+        
+        prompt = self.error_template.format(**template_vars)
+        
+        # Generate recovery response
+        response = await self.llm.generate(prompt)
+        return response.strip() if response else f"Error recovery failed: {error_msg}"
     
     def _calculate_overall_confidence(
         self,
